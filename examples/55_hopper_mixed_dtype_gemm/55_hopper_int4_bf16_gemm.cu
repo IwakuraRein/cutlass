@@ -429,7 +429,7 @@ void initialize(Options const& options) {
   block_zero.reset(scale_k * options.l * options.n);
 
   initialize_tensor(block_A, seed + 2022);
-  initialize_quant_tensor(block_B, seed + 2021);
+  initialize_tensor(block_B, seed + 2021);
   initialize_tensor(block_C, seed + 2020);
   initialize_scale(block_scale, options);
   initialize_zero(block_zero, options);

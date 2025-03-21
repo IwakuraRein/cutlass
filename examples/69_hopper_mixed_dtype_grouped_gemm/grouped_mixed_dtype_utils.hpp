@@ -184,10 +184,6 @@ void grouped_mixed_dtype_profiling(
     result.avg_runtime_ms = std::accumulate(runtimes.begin(), runtimes.end(), 0.0f) / runtimes.size();
     result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
 
-    std::cout << "  Problem Sizes, Alpha, Beta\n";
-    for (int32_t i = 0; i < options.groups; ++i) {
-        std::cout << "    " << options.problem_sizes_host[i] << ", " << alpha_host[i] << ", " << beta_host[i] << '\n';
-    }
     std::cout << "  Groups      : " << options.groups << '\n'
               << "  Avg runtime : " << result.avg_runtime_ms << " ms\n"
               << "  GFLOPS      : " << result.gflops << '\n';
