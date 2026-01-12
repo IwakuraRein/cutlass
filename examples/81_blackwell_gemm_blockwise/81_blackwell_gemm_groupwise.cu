@@ -81,7 +81,7 @@ using LayoutB             = cutlass::layout::ColumnMajor;                   // L
 constexpr int AlignmentB  = 128 / cutlass::sizeof_bits<ElementB>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
 
 // C/D matrix configuration
-using ElementC            = cutlass::float_e4m3_t;                          // Element type for C and D matrix operands
+using ElementC            = cutlass::bfloat16_t;                          // Element type for C and D matrix operands
 using LayoutC             = cutlass::layout::ColumnMajor;                   // Layout type for C and D matrix operands
 constexpr int AlignmentC  = 128 / cutlass::sizeof_bits<ElementC>::value;    // Memory access granularity/alignment of A matrix in units of elements (up to 16 bytes)
 
@@ -96,9 +96,9 @@ using ElementCompute = float;
 
 // MMA and Cluster Tile Shapes
 // Shape of the tile computed by tcgen05 MMA, could be across 2 SMs if Cluster Shape %2 == 0 
-using MmaTileShape_MNK = Shape<_256,_128,_128>;                          
+using MmaTileShape_MNK = Shape<_128,_128,_128>;                          
 // Shape of the threadblocks in a cluster
-using ClusterShape_MNK = Shape<_2,_1,_1>;
+using ClusterShape_MNK = Shape<_1,_1,_1>;
  
 constexpr int ScaleGranularityM = 1;
 constexpr int ScaleGranularityN = 128;
@@ -118,7 +118,7 @@ using CollectiveEpilogue = typename cutlass::epilogue::collective::CollectiveBui
     MmaTileShape_MNK, ClusterShape_MNK,
     cutlass::epilogue::collective::EpilogueTileAuto,
     ElementAccumulator, ElementCompute,
-    ElementC, LayoutC, AlignmentC,
+    void, LayoutC, AlignmentC,
     ElementD, LayoutC, AlignmentD,
     cutlass::epilogue::collective::EpilogueScheduleAuto
   >::CollectiveOp;
@@ -163,6 +163,7 @@ cutlass::HostTensor<ElementB          , LayoutB> tensor_B;
 cutlass::HostTensor<ElementAccumulator, cutlass::layout::PackedVectorLayout> tensor_SFB;
 cutlass::HostTensor<ElementC          , LayoutC> tensor_C;
 cutlass::HostTensor<ElementD          , LayoutD> tensor_D;
+cutlass::HostTensor<ElementD          , LayoutD> vllm_tensor_D;
 cutlass::HostTensor<ElementD          , LayoutD> tensor_ref_D;
 
 #endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
@@ -377,12 +378,16 @@ void initialize(const Options &options) {
   tensor_C.resize(c_coord);
   tensor_D.resize(c_coord);
   tensor_ref_D.resize(c_coord);
+  vllm_tensor_D.resize(c_coord);
   tensor_SFA.resize(blockscale_a_coord);
   tensor_SFB.resize(blockscale_b_coord);
 
   initialize_tensor(tensor_A.host_view(), cutlass::Distribution::Uniform, seed + 2022);
   initialize_tensor(tensor_B.host_view(), cutlass::Distribution::Uniform, seed + 2023);
-  initialize_tensor(tensor_C.host_view(), cutlass::Distribution::Uniform, seed + 2024);
+  // initialize_tensor(tensor_C.host_view(), cutlass::Distribution::Uniform, seed + 2024);
+  for (int i = 0; i < options.m * options.n * options.l; i++) {
+    tensor_C.host_data()[i] = static_cast<ElementC>(0);
+  }
 
   initialize_scale_tensor(tensor_SFA.host_view(), cutlass::Distribution::Uniform, seed + 2025);
   initialize_scale_tensor(tensor_SFB.host_view(), cutlass::Distribution::Uniform, seed + 2026);
@@ -391,7 +396,7 @@ void initialize(const Options &options) {
   tensor_B.sync_device();
   tensor_C.sync_device();
   tensor_D.sync_device();
-
+  vllm_tensor_D.sync_device();
   tensor_SFA.sync_device();
   tensor_SFB.sync_device();
 
@@ -399,6 +404,7 @@ void initialize(const Options &options) {
 
 /// Populates a Gemm::Arguments structure from the given commandline options
 typename Gemm::Arguments args_from_options(const Options &options) {
+  cutlass::KernelHardwareInfo hw_info;
   typename Gemm::Arguments arguments {
     cutlass::gemm::GemmUniversalMode::kGemm,
     {options.m, options.n, options.k, options.l},
@@ -408,14 +414,15 @@ typename Gemm::Arguments args_from_options(const Options &options) {
      tensor_SFB.device_data(), layout_SFB},
     {
       {}, // epilogue.thread
-      tensor_C.device_data(), stride_C,
+      nullptr, stride_C,
       tensor_D.device_data(), stride_D
-    }
+    },
+    hw_info
   };
 
-  auto &fusion_args = arguments.epilogue.thread;
-  fusion_args.alpha = options.alpha;
-  fusion_args.beta = options.beta;
+  // auto &fusion_args = arguments.epilogue.thread;
+  // fusion_args.alpha = options.alpha;
+  // fusion_args.beta = options.beta;
 
   return arguments;
 }
@@ -471,6 +478,22 @@ bool verify(const Options &options) {
   return passed;
 }
 
+#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "vllm_gemm_groupwise.h"
+
+void printHostTensor(const cutlass::HostTensor<ElementD, LayoutD> &tensor, int m, int n) {
+  for (int i = 0; i < m; i++) {
+    for (int j = 0; j < n; j++) {
+      std::cout << tensor.host_data()[i * n + j] << " ";
+    }
+    std::cout << std::endl;
+  }
+  std::cout << std::endl;
+}
+
 /// Execute a given example GEMM computation
 template <typename Gemm>
 int run(Options &options) {
@@ -506,38 +529,50 @@ int run(Options &options) {
     // Check if output from CUTLASS kernel and reference kernel are equal or not
     result.passed = verify(options);
 
-    std::cout << "  Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
+    std::cout << "  Cutlass_example Disposition: " << (result.passed ? "Passed" : "Failed") << std::endl;
 
-    if (!result.passed) {
-      exit(-1);
-    }
   }
 
-  // Run profiling loop
-  if (options.iterations > 0) {
-    GpuTimer timer;
-    timer.start();
-    for (int iter = 0; iter < options.iterations; ++iter) {
-      CUTLASS_CHECK(gemm.run());
-    }
-    timer.stop();
+  using VllmGemmConfig = vllm::cutlass_3x_gemm_fp8_blockwise<
+    ElementD, ScaleGranularityM, ScaleGranularityN, ScaleGranularityK, MmaTileShape_MNK,
+    ClusterShape_MNK, cutlass::epilogue::collective::EpilogueScheduleAuto,
+    cutlass::gemm::KernelScheduleSm100Blockwise>;
+  using VllmGemmKernel = VllmGemmConfig::GemmKernel;
+  using VllmGemm = cutlass::gemm::device::GemmUniversalAdapter<VllmGemmKernel>;
+  VllmGemm gemm_;
+  auto arguments_ = vllm::cutlass_gemm_caller_blockwise<VllmGemmConfig>(
+    vllm_tensor_D.device_data(),
+    tensor_A.device_data(),
+    tensor_B.device_data(),
+    tensor_SFA.device_data(),
+    tensor_SFB.device_data(),
+    options.m, options.n, options.k
+  );
+  size_t workspace_size_ = VllmGemm::get_workspace_size(arguments_);
 
-    // Compute average runtime and GFLOPs.
-    float elapsed_ms = timer.elapsed_millis();
-    result.avg_runtime_ms = double(elapsed_ms) / double(options.iterations);
-    result.gflops = options.gflops(result.avg_runtime_ms / 1000.0);
+  // Allocate workspace memory
+  cutlass::device_memory::allocation<uint8_t> workspace_(workspace_size_);
+  CUTLASS_CHECK(gemm_.can_implement(arguments_));
+  CUTLASS_CHECK(gemm_.initialize(arguments_, workspace_.get()));
+  CUTLASS_CHECK(gemm_.run());
 
-    std::cout << "  Problem Size: " << options.m << 'x' << options.n << 'x' << options.k << 'x' << options.l << std::endl;
-    std::cout << "  Avg runtime: " << result.avg_runtime_ms << " ms" << std::endl;
-    std::cout << "  GFLOPS: " << result.gflops << std::endl;
-  }
+  
+  // tensor_D.sync_host();
+  vllm_tensor_D.sync_host();
+  bool passed = cutlass::reference::host::TensorEquals(vllm_tensor_D.host_view(), tensor_D.host_view());
+  if (!passed) std::cout << "  VLLM Disposition: Failed" << std::endl;
+  else std::cout << "  VLLM Disposition: Passed" << std::endl;
+
+  std::cout << "================================================" << std::endl;
+  std::cout << "Cutlass_example Result: " << std::endl;
+  printHostTensor(tensor_D, options.m, options.n);
+  std::cout << "================================================" << std::endl;
+  std::cout << "VLLM Result: " << std::endl;
+  printHostTensor(vllm_tensor_D, options.m, options.n);
+  std::cout << "================================================" << std::endl;
 
   return 0;
 }
-
-#endif // defined(CUTLASS_ARCH_MMA_SM100_SUPPORTED)
-
-///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int main(int argc, char const **args) {
 
@@ -555,10 +590,7 @@ int main(int argc, char const **args) {
   CUDA_CHECK(cudaGetDevice(&current_device_id));
   CUDA_CHECK(cudaGetDeviceProperties(&props, current_device_id));
   cudaError_t error = cudaGetDeviceProperties(&props, 0);
-  if (props.major != 10 || props.minor != 0) {
-    std::cerr << "This example requires a GPU with compute capability 100a)." << std::endl;
-    return 0;
-  } 
+
   
 
   //
